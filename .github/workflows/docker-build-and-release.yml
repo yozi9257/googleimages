@@ -1,12 +1,10 @@
-name: Build Docker Image and Release (Split Compress)
+name: Build Docker Image and Release (Split Compress + Storage Optimize)
 
-# 触发条件：推送任意标签
 on:
   push:
     tags:
       - '*'
 
-# 必要权限：创建Release、上传资产
 permissions:
   contents: write
 
@@ -15,99 +13,98 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       ###########################################################################
-      # 步骤1：检出仓库代码（获取Dockerfile）
+      # 步骤0：紧急清理Runner冗余文件（优先释放空间，核心优化）
       ###########################################################################
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Free up Runner disk space
+        run: |
+          echo "===== 清理前磁盘使用情况 ====="
+          df -h
+          
+          # 1. 删除预安装的大型工具/镜像（GitHub Runner默认预装，非必需）
+          sudo rm -rf /usr/local/lib/android  # 安卓SDK（约10GB）
+          sudo rm -rf /opt/ghc                # Haskell编译器（约2GB）
+          sudo rm -rf /usr/share/dotnet       # .NET SDK（约2GB）
+          sudo rm -rf /opt/hostedtoolcache/*  # 缓存的工具链（如Python/Node版本）
+          
+          # 2. 删除Docker旧镜像/缓存（释放容器存储）
+          docker system prune -a -f --volumes
+          
+          # 3. 清理APT缓存
+          sudo apt-get clean
+          sudo apt-get autoremove -y
+          
+          echo "===== 清理后磁盘使用情况 ====="
+          df -h
 
       ###########################################################################
-      # 步骤2：设置环境变量（提取纯标签名、定义镜像/文件名称）
+      # 步骤1：检出仓库代码（浅克隆，减少代码体积）
+      ###########################################################################
+      - name: Checkout code (shallow clone)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1  # 浅克隆，只拉取最新提交，不下载完整历史
+
+      ###########################################################################
+      # 步骤2：设置环境变量
       ###########################################################################
       - name: Set environment variables
         id: set_vars
         run: |
-          # 提取纯标签名（去掉refs/tags/前缀，避免路径分隔符）
           TAG_NAME=$(basename "${GITHUB_REF}")
-          # 清理标签名中的特殊字符（确保镜像名/文件名合法）
           IMAGE_NAME=$(echo "${TAG_NAME}" | tr -cd 'a-zA-Z0-9_-')
-          # 原始tar包名称（未压缩）
-          RAW_TAR_FILE="${IMAGE_NAME}.tar"
-          # 分卷压缩后的前缀（最终分卷为：xxx.tar.gz.001、xxx.tar.gz.002...）
           SPLIT_PREFIX="${IMAGE_NAME}.tar.gz"
           
-          # 打印变量（调试用，可在Actions日志中查看）
-          echo "===== 环境变量信息 ====="
-          echo "GITHUB_REF: ${GITHUB_REF}"
-          echo "TAG_NAME: ${TAG_NAME}"
-          echo "IMAGE_NAME: ${IMAGE_NAME}"
-          echo "RAW_TAR_FILE: ${RAW_TAR_FILE}"
-          echo "SPLIT_PREFIX: ${SPLIT_PREFIX}"
-          
-          # 写入环境变量供后续步骤使用
           echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
-          echo "RAW_TAR_FILE=${RAW_TAR_FILE}" >> $GITHUB_ENV
           echo "SPLIT_PREFIX=${SPLIT_PREFIX}" >> $GITHUB_ENV
+          echo "===== 环境变量 ====="
+          echo "TAG_NAME: ${TAG_NAME}"
+          echo "IMAGE_NAME: ${IMAGE_NAME}"
 
       ###########################################################################
-      # 步骤3：构建Docker镜像（常规构建，无特殊修改）
+      # 步骤3：构建Docker镜像（优化构建缓存，减少临时文件）
       ###########################################################################
-      - name: Build Docker image
+      - name: Build Docker image (optimize cache)
         run: |
-          echo "===== 开始构建Docker镜像 ====="
-          docker build -t ${IMAGE_NAME}:latest .
-          # 验证镜像是否构建成功
+          echo "===== 构建Docker镜像 ====="
+          # 构建时禁用缓存，减少临时文件；同时压缩镜像层
+          docker build --no-cache --compress -t ${IMAGE_NAME}:latest .
           docker images | grep ${IMAGE_NAME}
 
       ###########################################################################
-      # 步骤4：保存镜像并分卷压缩（核心：拆分超过2GB的文件）
+      # 步骤4：边保存边压缩+分卷（核心：不生成完整大tar包，节省空间）
       ###########################################################################
-      - name: Save and split Docker image
+      - name: Save, compress and split Docker image (no full tar)
         run: |
-          echo "===== 保存Docker镜像为原始tar包 ====="
-          # 先保存未压缩的tar包（避免压缩后仍超2GB，split直接拆分原始包）
-          docker save ${IMAGE_NAME}:latest > ${RAW_TAR_FILE}
-          
-          echo "===== 分卷压缩（单卷1900M，留余量避免超2GB） ====="
-          # split参数说明：
-          # -b 1900M：单文件最大1900MB
-          # ${RAW_TAR_FILE}：要拆分的源文件
-          # ${SPLIT_PREFIX}.：分卷文件前缀（最终为xxx.tar.gz.001）
-          # --numeric-suffixes=1：数字后缀从001开始
-          # --suffix-length=3：后缀长度3位（001/002...）
-          split -b 1900M ${RAW_TAR_FILE} ${SPLIT_PREFIX}. --numeric-suffixes=1 --suffix-length=3
+          echo "===== 开始镜像导出+压缩+分卷 ====="
+          # 核心优化：docker save → gzip压缩 → split分卷（一步到位，无中间大文件）
+          docker save ${IMAGE_NAME}:latest | gzip | split -b 1900M - ${SPLIT_PREFIX}. --numeric-suffixes=1 --suffix-length=3
           
           echo "===== 验证分卷文件 ====="
-          # 列出所有分卷文件，确认生成
           ls -lh ${SPLIT_PREFIX}.*
           
-          # 统计分卷数量，写入环境变量
+          # 统计分卷数量
           SPLIT_COUNT=$(ls -1 ${SPLIT_PREFIX}.* | wc -l)
           echo "SPLIT_COUNT=${SPLIT_COUNT}" >> $GITHUB_ENV
-          
-          # 收集所有分卷文件路径，用空格分隔，供上传使用
           SPLIT_FILES=$(ls -1 ${SPLIT_PREFIX}.* | tr '\n' ' ')
           echo "SPLIT_FILES=${SPLIT_FILES}" >> $GITHUB_ENV
-          echo "分卷数量：${SPLIT_COUNT}，分卷文件列表：${SPLIT_FILES}"
 
       ###########################################################################
-      # 步骤5：创建Release并上传所有分卷文件
+      # 步骤5：创建Release并上传分卷
       ###########################################################################
       - name: Create Release and upload split assets
         uses: softprops/action-gh-release@v2
         with:
-          # Release标题（用纯标签名）
           name: Release ${TAG_NAME}
-          # Release描述（包含合并/导入镜像的命令，方便用户使用）
           body: |
             ## Docker镜像发布（${TAG_NAME}）
             ### 镜像信息
             - 镜像名：${IMAGE_NAME}:latest
             - 分卷数量：${SPLIT_COUNT} 个
-            - 单卷大小：最大1900MB（避免GitHub 2GB限制）
+            - 单卷大小：最大1900MB
             
             ### 使用步骤
             1. 下载所有分卷文件到同一目录
-            2. 合并分卷为完整tar包：
+            2. 合并分卷并解压：
                ```bash
-               cat ${SPLIT_PREFIX}.* > ${RAW_TAR_FILE}
+               cat ${SPLIT_PREFIX}.* | gzip -d > ${IMAGE_NAME}.tar
