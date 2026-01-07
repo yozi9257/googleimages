@@ -1,5 +1,6 @@
 name: Build Docker Image and Release
 
+# 触发任意标签推送
 on:
   push:
     tags:
@@ -18,26 +19,32 @@ jobs:
       - name: Set environment variables
         id: set_vars
         run: |
-          # 提取完整tag名（如v1.0.0，保留v前缀）
-          TAG_NAME=${GITHUB_REF#refs/tags/v}
-          # 镜像名改为使用完整tag名
-          IMAGE_NAME=${TAG_NAME}
-          # 压缩包名称（镜像名.tar.gz，也可保留版本标识，这里和镜像名一致）
+          # 核心修复：用basename提取纯标签名（去掉refs/tags/前缀）
+          TAG_NAME=$(basename "${GITHUB_REF}")
+          # 可选：清理标签名中的特殊字符（避免/、:等导致文件名异常）
+          IMAGE_NAME=$(echo "${TAG_NAME}" | tr -cd 'a-zA-Z0-9_-')
+          # 压缩包名仅用纯标签名，无路径分隔符
           TAR_FILE="${IMAGE_NAME}.tar.gz"
+          
+          # 打印变量验证（方便调试）
+          echo "GITHUB_REF: ${GITHUB_REF}"
+          echo "TAG_NAME: ${TAG_NAME}"
+          echo "IMAGE_NAME: ${IMAGE_NAME}"
+          echo "TAR_FILE: ${TAR_FILE}"
           
           echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
           echo "TAR_FILE=${TAR_FILE}" >> $GITHUB_ENV
 
-      # 步骤3：构建Docker镜像（镜像名改为tag名）
       - name: Build Docker image
         run: |
           docker build -t ${IMAGE_NAME}:latest .
 
-      # 步骤4：将镜像保存为tar包并压缩
       - name: Save and compress Docker image
         run: |
+          # 现在TAR_FILE是纯文件名（如crosvm-dev-r0052.tar.gz），无路径分隔符
           docker save ${IMAGE_NAME}:latest | gzip > ${TAR_FILE}
+          # 验证文件生成
           ls -lh ${TAR_FILE}
 
       - name: Create Release and upload asset
