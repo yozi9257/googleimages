@@ -1,0 +1,55 @@
+name: Build Docker Image and Release
+
+on:
+  push:
+    tags:
+      - '*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set environment variables
+        id: set_vars
+        run: |
+          # 提取完整tag名（如v1.0.0，保留v前缀）
+          TAG_NAME=${GITHUB_REF#refs/tags/v}
+          # 镜像名改为使用完整tag名
+          IMAGE_NAME=${TAG_NAME}
+          # 压缩包名称（镜像名.tar.gz，也可保留版本标识，这里和镜像名一致）
+          TAR_FILE="${IMAGE_NAME}.tar.gz"
+          
+          echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
+          echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
+          echo "TAR_FILE=${TAR_FILE}" >> $GITHUB_ENV
+
+      # 步骤3：构建Docker镜像（镜像名改为tag名）
+      - name: Build Docker image
+        run: |
+          docker build -t ${IMAGE_NAME}:latest .
+
+      # 步骤4：将镜像保存为tar包并压缩
+      - name: Save and compress Docker image
+        run: |
+          docker save ${IMAGE_NAME}:latest | gzip > ${TAR_FILE}
+          ls -lh ${TAR_FILE}
+
+      - name: Create Release and upload asset
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${TAG_NAME}
+          body: |
+            ## ${IMAGE_NAME} (Tag: ${TAG_NAME})
+            - Docker镜像压缩包：${TAR_FILE}
+            - 镜像标签：${IMAGE_NAME}:latest
+          files: |
+            ${{ env.TAR_FILE }}
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
