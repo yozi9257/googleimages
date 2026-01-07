@@ -1,4 +1,4 @@
-name: Build Docker Image and Release (Fixed Variables + Assets)
+name: Build Docker Image and Release (Fixed Newline Issue)
 
 on:
   push:
@@ -12,9 +12,6 @@ jobs:
   build-and-release-split:
     runs-on: ubuntu-latest
     steps:
-      ###########################################################################
-      # 步骤0：清理磁盘空间（必选，解决存储不足）
-      ###########################################################################
       - name: Free up Runner disk space
         run: |
           echo "===== 清理前磁盘使用 ====="
@@ -25,94 +22,77 @@ jobs:
           echo "===== 清理后磁盘使用 ====="
           df -h
 
-      ###########################################################################
-      # 步骤1：浅克隆代码
-      ###########################################################################
       - name: Checkout code (shallow clone)
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
 
-      ###########################################################################
-      # 步骤2：设置环境变量（强制导出为step输出+env，双重保障）
-      ###########################################################################
       - name: Set environment variables
-        id: set_vars  # 关键：通过id导出step输出，供后续引用
+        id: set_vars
         run: |
-          # 提取纯标签名
           TAG_NAME=$(basename "${GITHUB_REF}")
-          # 清理镜像名特殊字符
           IMAGE_NAME=$(echo "${TAG_NAME}" | tr -cd 'a-zA-Z0-9_-')
-          # 分卷前缀（绝对路径，避免路径问题）
+          # 绝对路径分卷前缀（避免路径问题）
           SPLIT_PREFIX="${GITHUB_WORKSPACE}/${IMAGE_NAME}.tar.gz"
           
-          # 打印变量（关键调试：确认值正确）
           echo "===== 生成的变量值 ====="
           echo "TAG_NAME: ${TAG_NAME}"
           echo "IMAGE_NAME: ${IMAGE_NAME}"
           echo "SPLIT_PREFIX: ${SPLIT_PREFIX}"
           
-          # 方式1：写入GitHub ENV（供shell步骤使用）
+          # 写入ENV
           echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
           echo "SPLIT_PREFIX=${SPLIT_PREFIX}" >> $GITHUB_ENV
-          
-          # 方式2：导出为step输出（供YAML字段直接引用，核心修复）
+          # 导出step输出（无换行）
           echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
           echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
           echo "split_prefix=${SPLIT_PREFIX}" >> $GITHUB_OUTPUT
 
-      ###########################################################################
-      # 步骤3：构建Docker镜像
-      ###########################################################################
       - name: Build Docker image
         run: |
           echo "===== 构建镜像：${{ env.IMAGE_NAME }} ====="
           docker build --no-cache --compress -t ${{ env.IMAGE_NAME }}:latest .
-          # 验证镜像存在
           if ! docker images | grep ${{ env.IMAGE_NAME }}; then
             echo "ERROR: 镜像构建失败"
             exit 1
           fi
 
-      ###########################################################################
-      # 步骤4：导出+压缩+分卷（强制检查分卷文件）
-      ###########################################################################
-      - name: Save, compress and split image
-        id: split_step  # 导出分卷信息
+      - name: Save, compress and split image (fix newline)
+        id: split_step
         run: |
           echo "===== 开始分卷处理 ====="
           # 管道流分卷（无中间大文件）
           docker save ${{ env.IMAGE_NAME }}:latest | gzip | split -b 1900M - ${{ env.SPLIT_PREFIX }}. --numeric-suffixes=1 --suffix-length=3
           
+          # 核心修复：将分卷文件列表转为【空格分隔的单行字符串】（避免换行符）
+          # ls -1 列出文件（每行一个）→ tr '\n' ' ' 替换换行为空格 → xargs 去除末尾多余空格
+          SPLIT_FILES=$(ls -1 ${{ env.SPLIT_PREFIX }}.* 2>/dev/null | tr '\n' ' ' | xargs)
+          
           # 强制检查分卷文件是否生成
-          SPLIT_FILES=$(ls -1 ${{ env.SPLIT_PREFIX }}.* 2>/dev/null || true)
           if [ -z "$SPLIT_FILES" ]; then
             echo "ERROR: 分卷文件未生成！"
             exit 1
           fi
           
-          # 统计分卷数量
-          SPLIT_COUNT=$(echo "$SPLIT_FILES" | wc -l)
+          # 统计分卷数量（用wc -w统计空格分隔的文件数）
+          SPLIT_COUNT=$(echo "$SPLIT_FILES" | wc -w)
+          
           echo "===== 分卷结果 ====="
           echo "分卷数量：${SPLIT_COUNT}"
-          echo "分卷文件：${SPLIT_FILES}"
+          echo "分卷文件（单行）：${SPLIT_FILES}" # 验证是单行无换行
           
-          # 写入ENV和step输出
+          # 写入ENV（单行字符串，无换行）
           echo "SPLIT_COUNT=${SPLIT_COUNT}" >> $GITHUB_ENV
           echo "SPLIT_FILES=${SPLIT_FILES}" >> $GITHUB_ENV
+          # 导出step输出（单行字符串，无换行）
           echo "split_count=${SPLIT_COUNT}" >> $GITHUB_OUTPUT
           echo "split_files=${SPLIT_FILES}" >> $GITHUB_OUTPUT
 
-      ###########################################################################
-      # 步骤5：创建Release并上传Assets（核心修复变量渲染）
-      ###########################################################################
       - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          # Release标题（使用step输出的变量）
           name: Release ${{ steps.set_vars.outputs.tag_name }}
-          # Release描述（核心修复：用${{ }}引用变量，而非${}）
           body: |
             ## Docker镜像发布（${{ steps.set_vars.outputs.tag_name }}）
             ### 镜像信息
