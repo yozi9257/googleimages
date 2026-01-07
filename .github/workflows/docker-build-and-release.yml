@@ -1,4 +1,4 @@
-name: Build Docker Image and Release (Split Compress + Storage Optimize)
+name: Build Docker Image and Release (Fixed Variables + Assets)
 
 on:
   push:
@@ -13,98 +13,115 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       ###########################################################################
-      # 步骤0：紧急清理Runner冗余文件（优先释放空间，核心优化）
+      # 步骤0：清理磁盘空间（必选，解决存储不足）
       ###########################################################################
       - name: Free up Runner disk space
         run: |
-          echo "===== 清理前磁盘使用情况 ====="
+          echo "===== 清理前磁盘使用 ====="
           df -h
-          
-          # 1. 删除预安装的大型工具/镜像（GitHub Runner默认预装，非必需）
-          sudo rm -rf /usr/local/lib/android  # 安卓SDK（约10GB）
-          sudo rm -rf /opt/ghc                # Haskell编译器（约2GB）
-          sudo rm -rf /usr/share/dotnet       # .NET SDK（约2GB）
-          sudo rm -rf /opt/hostedtoolcache/*  # 缓存的工具链（如Python/Node版本）
-          
-          # 2. 删除Docker旧镜像/缓存（释放容器存储）
+          sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache/*
           docker system prune -a -f --volumes
-          
-          # 3. 清理APT缓存
-          sudo apt-get clean
-          sudo apt-get autoremove -y
-          
-          echo "===== 清理后磁盘使用情况 ====="
+          sudo apt-get clean && sudo apt-get autoremove -y
+          echo "===== 清理后磁盘使用 ====="
           df -h
 
       ###########################################################################
-      # 步骤1：检出仓库代码（浅克隆，减少代码体积）
+      # 步骤1：浅克隆代码
       ###########################################################################
       - name: Checkout code (shallow clone)
         uses: actions/checkout@v4
         with:
-          fetch-depth: 1  # 浅克隆，只拉取最新提交，不下载完整历史
+          fetch-depth: 1
 
       ###########################################################################
-      # 步骤2：设置环境变量
+      # 步骤2：设置环境变量（强制导出为step输出+env，双重保障）
       ###########################################################################
       - name: Set environment variables
-        id: set_vars
+        id: set_vars  # 关键：通过id导出step输出，供后续引用
         run: |
+          # 提取纯标签名
           TAG_NAME=$(basename "${GITHUB_REF}")
+          # 清理镜像名特殊字符
           IMAGE_NAME=$(echo "${TAG_NAME}" | tr -cd 'a-zA-Z0-9_-')
-          SPLIT_PREFIX="${IMAGE_NAME}.tar.gz"
+          # 分卷前缀（绝对路径，避免路径问题）
+          SPLIT_PREFIX="${GITHUB_WORKSPACE}/${IMAGE_NAME}.tar.gz"
           
+          # 打印变量（关键调试：确认值正确）
+          echo "===== 生成的变量值 ====="
+          echo "TAG_NAME: ${TAG_NAME}"
+          echo "IMAGE_NAME: ${IMAGE_NAME}"
+          echo "SPLIT_PREFIX: ${SPLIT_PREFIX}"
+          
+          # 方式1：写入GitHub ENV（供shell步骤使用）
           echo "TAG_NAME=${TAG_NAME}" >> $GITHUB_ENV
           echo "IMAGE_NAME=${IMAGE_NAME}" >> $GITHUB_ENV
           echo "SPLIT_PREFIX=${SPLIT_PREFIX}" >> $GITHUB_ENV
-          echo "===== 环境变量 ====="
-          echo "TAG_NAME: ${TAG_NAME}"
-          echo "IMAGE_NAME: ${IMAGE_NAME}"
-
-      ###########################################################################
-      # 步骤3：构建Docker镜像（优化构建缓存，减少临时文件）
-      ###########################################################################
-      - name: Build Docker image (optimize cache)
-        run: |
-          echo "===== 构建Docker镜像 ====="
-          # 构建时禁用缓存，减少临时文件；同时压缩镜像层
-          docker build --no-cache --compress -t ${IMAGE_NAME}:latest .
-          docker images | grep ${IMAGE_NAME}
-
-      ###########################################################################
-      # 步骤4：边保存边压缩+分卷（核心：不生成完整大tar包，节省空间）
-      ###########################################################################
-      - name: Save, compress and split Docker image (no full tar)
-        run: |
-          echo "===== 开始镜像导出+压缩+分卷 ====="
-          # 核心优化：docker save → gzip压缩 → split分卷（一步到位，无中间大文件）
-          docker save ${IMAGE_NAME}:latest | gzip | split -b 1900M - ${SPLIT_PREFIX}. --numeric-suffixes=1 --suffix-length=3
           
-          echo "===== 验证分卷文件 ====="
-          ls -lh ${SPLIT_PREFIX}.*
+          # 方式2：导出为step输出（供YAML字段直接引用，核心修复）
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+          echo "image_name=${IMAGE_NAME}" >> $GITHUB_OUTPUT
+          echo "split_prefix=${SPLIT_PREFIX}" >> $GITHUB_OUTPUT
+
+      ###########################################################################
+      # 步骤3：构建Docker镜像
+      ###########################################################################
+      - name: Build Docker image
+        run: |
+          echo "===== 构建镜像：${{ env.IMAGE_NAME }} ====="
+          docker build --no-cache --compress -t ${{ env.IMAGE_NAME }}:latest .
+          # 验证镜像存在
+          if ! docker images | grep ${{ env.IMAGE_NAME }}; then
+            echo "ERROR: 镜像构建失败"
+            exit 1
+          fi
+
+      ###########################################################################
+      # 步骤4：导出+压缩+分卷（强制检查分卷文件）
+      ###########################################################################
+      - name: Save, compress and split image
+        id: split_step  # 导出分卷信息
+        run: |
+          echo "===== 开始分卷处理 ====="
+          # 管道流分卷（无中间大文件）
+          docker save ${{ env.IMAGE_NAME }}:latest | gzip | split -b 1900M - ${{ env.SPLIT_PREFIX }}. --numeric-suffixes=1 --suffix-length=3
+          
+          # 强制检查分卷文件是否生成
+          SPLIT_FILES=$(ls -1 ${{ env.SPLIT_PREFIX }}.* 2>/dev/null || true)
+          if [ -z "$SPLIT_FILES" ]; then
+            echo "ERROR: 分卷文件未生成！"
+            exit 1
+          fi
           
           # 统计分卷数量
-          SPLIT_COUNT=$(ls -1 ${SPLIT_PREFIX}.* | wc -l)
+          SPLIT_COUNT=$(echo "$SPLIT_FILES" | wc -l)
+          echo "===== 分卷结果 ====="
+          echo "分卷数量：${SPLIT_COUNT}"
+          echo "分卷文件：${SPLIT_FILES}"
+          
+          # 写入ENV和step输出
           echo "SPLIT_COUNT=${SPLIT_COUNT}" >> $GITHUB_ENV
-          SPLIT_FILES=$(ls -1 ${SPLIT_PREFIX}.* | tr '\n' ' ')
           echo "SPLIT_FILES=${SPLIT_FILES}" >> $GITHUB_ENV
+          echo "split_count=${SPLIT_COUNT}" >> $GITHUB_OUTPUT
+          echo "split_files=${SPLIT_FILES}" >> $GITHUB_OUTPUT
 
       ###########################################################################
-      # 步骤5：创建Release并上传分卷
+      # 步骤5：创建Release并上传Assets（核心修复变量渲染）
       ###########################################################################
-      - name: Create Release and upload split assets
+      - name: Create Release and upload assets
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${TAG_NAME}
+          # Release标题（使用step输出的变量）
+          name: Release ${{ steps.set_vars.outputs.tag_name }}
+          # Release描述（核心修复：用${{ }}引用变量，而非${}）
           body: |
-            ## Docker镜像发布（${TAG_NAME}）
+            ## Docker镜像发布（${{ steps.set_vars.outputs.tag_name }}）
             ### 镜像信息
-            - 镜像名：${IMAGE_NAME}:latest
-            - 分卷数量：${SPLIT_COUNT} 个
-            - 单卷大小：最大1900MB
+            - 镜像名：${{ steps.set_vars.outputs.image_name }}:latest
+            - 分卷数量：${{ steps.split_step.outputs.split_count }} 个
+            - 单卷大小：最大1900MB（避免GitHub 2GB限制）
             
             ### 使用步骤
             1. 下载所有分卷文件到同一目录
-            2. 合并分卷并解压：
+            2. 合并分卷并解压（复制以下命令执行）：
                ```bash
-               cat ${SPLIT_PREFIX}.* | gzip -d > ${IMAGE_NAME}.tar
+               cat ${{ steps.set_vars.outputs.split_prefix }}.* | gzip -d > ${{ steps.set_vars.outputs.image_name }}.tar
